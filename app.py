@@ -21,6 +21,7 @@ REGIONS = {
 DEFAULT_CONFIG = {
     "api_key": "",
     "region": "Global",
+    "model": "MiniMax-M2.7",
     "refresh_minutes": 5,
 }
 
@@ -130,7 +131,7 @@ class MinimaxTrackerApp(rumps.App):
 
         # Minimal chat completion — 1 token output, just to get rate-limit headers.
         payload = {
-            "model": "MiniMax-Text-01",
+            "model": self.config.get("model", "MiniMax-M2.7"),
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
         }
@@ -216,6 +217,20 @@ class MinimaxTrackerApp(rumps.App):
             return
         api_key = r.text.strip()
 
+        # --- Model ---
+        win_model = rumps.Window(
+            message="Model name (e.g. MiniMax-M2.7, abab6.5s-chat):",
+            title="Minimax Tracker — Settings",
+            default_text=self.config.get("model", "MiniMax-M2.7"),
+            ok="Next",
+            cancel="Cancel",
+            dimensions=(400, 24),
+        )
+        r1b = win_model.run()
+        if not r1b.clicked:
+            return
+        model = r1b.text.strip() or "MiniMax-M2.7"
+
         # --- Region ---
         region_options = list(REGIONS.keys())
         current_region = self.config.get("region", "Global")
@@ -256,6 +271,7 @@ class MinimaxTrackerApp(rumps.App):
             minutes = 5
 
         self.config["api_key"]         = api_key
+        self.config["model"]           = model
         self.config["region"]          = region
         self.config["refresh_minutes"] = minutes
         save_config(self.config)
