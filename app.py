@@ -120,18 +120,43 @@ class MinimaxTrackerApp(rumps.App):
     # Fetch logic
     # ------------------------------------------------------------------
 
+    def _write_log(self, text):
+        log_path = os.path.expanduser("~/.minimax-tracker.log")
+        with open(log_path, "w") as f:
+            f.write(text)
+
     def _do_fetch(self):
         api_key = self.config["api_key"].strip()
         base    = REGIONS.get(self.config.get("region", "Global"), REGIONS["Global"])
+        model   = self.config.get("model", "MiniMax-M2.7")
 
-        headers = {
+        req_headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type":  "application/json",
         }
 
-        # Minimal chat completion — 1 token output, just to get rate-limit headers.
+        now_str = datetime.now().strftime("%-I:%M %p")
+
+        # --- Step 1: try coding plan remains endpoint ---
+        plan_remaining = None
+        try:
+            plan_resp = requests.get(
+                f"{base}/v1/api/openplatform/coding_plan/remains",
+                headers=req_headers,
+                timeout=10,
+            )
+            plan_body = plan_resp.json()
+            base_resp = plan_body.get("base_resp", {})
+            if base_resp.get("status_code") == 0:
+                model_remains = plan_body.get("model_remains", [])
+                if model_remains:
+                    plan_remaining = model_remains
+        except Exception:
+            pass
+
+        # --- Step 2: minimal chat call to get rate-limit headers ---
         payload = {
-            "model": self.config.get("model", "MiniMax-M2.7"),
+            "model": model,
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
         }
@@ -139,53 +164,79 @@ class MinimaxTrackerApp(rumps.App):
         try:
             resp = requests.post(
                 f"{base}/v1/text/chatcompletion_v2",
-                headers=headers,
+                headers=req_headers,
                 json=payload,
                 timeout=15,
             )
         except requests.RequestException as exc:
-            rumps.notification(
-                "Minimax Tracker",
-                "Network error",
-                str(exc),
-                sound=False,
-            )
+            rumps.notification("Minimax Tracker", "Network error", str(exc), sound=False)
             self.title = "⚡ err"
             return
 
-        remaining = resp.headers.get("X-RateLimit-Remaining") or resp.headers.get("x-ratelimit-remaining")
-        limit     = resp.headers.get("X-RateLimit-Limit")     or resp.headers.get("x-ratelimit-limit")
-        reset_ts  = resp.headers.get("X-RateLimit-Reset")     or resp.headers.get("x-ratelimit-reset")
+        # Write debug log with full headers + body
+        log_lines = [
+            f"=== Minimax Tracker Debug Log — {datetime.now()} ===\n",
+            f"Endpoint: POST {base}/v1/text/chatcompletion_v2\n",
+            f"Model: {model}\n",
+            f"HTTP status: {resp.status_code}\n\n",
+            "--- Response Headers ---\n",
+        ]
+        for k, v in resp.headers.items():
+            log_lines.append(f"  {k}: {v}\n")
+        try:
+            log_lines.append(f"\n--- Response Body ---\n{json.dumps(resp.json(), indent=2)}\n")
+        except Exception:
+            log_lines.append(f"\n--- Response Body (raw) ---\n{resp.text[:500]}\n")
+        self._write_log("".join(log_lines))
 
-        if resp.status_code == 401 or resp.status_code == 403:
+        if resp.status_code in (401, 403):
             self.title = "⚡ auth err"
-            rumps.notification(
-                "Minimax Tracker",
-                "Auth error",
-                "Check your API key in Settings.",
-                sound=False,
-            )
+            rumps.notification("Minimax Tracker", "Auth error", "Check your API key in Settings.", sound=False)
             return
 
-        now_str = datetime.now().strftime("%-I:%M %p")
+        # Check all common rate-limit header spellings
+        remaining = (
+            resp.headers.get("X-RateLimit-Remaining")
+            or resp.headers.get("x-ratelimit-remaining")
+            or resp.headers.get("RateLimit-Remaining")
+            or resp.headers.get("ratelimit-remaining")
+        )
+        limit = (
+            resp.headers.get("X-RateLimit-Limit")
+            or resp.headers.get("x-ratelimit-limit")
+            or resp.headers.get("RateLimit-Limit")
+        )
+        reset_ts = (
+            resp.headers.get("X-RateLimit-Reset")
+            or resp.headers.get("x-ratelimit-reset")
+            or resp.headers.get("RateLimit-Reset")
+        )
 
-        if remaining is not None:
+        if plan_remaining is not None:
+            # Show coding plan data (list of per-model entries)
+            first = plan_remaining[0]
+            rem_val = first.get("remaining") or first.get("remain") or "?"
+            total   = first.get("total") or first.get("limit") or "?"
+            self.title = f"⚡ {rem_val} rem"
+            self.lbl_remaining.title = f"Remaining:  {rem_val}"
+            self.lbl_limit.title     = f"Limit:         {total}"
+            self.lbl_resets.title    = "Resets:       —"
+        elif remaining is not None:
             self.title = f"⚡ {int(remaining):,} rem"
             self.lbl_remaining.title = f"Remaining:  {int(remaining):,}"
             self.lbl_limit.title     = f"Limit:         {int(limit):,}" if limit else "Limit:         —"
             self.lbl_resets.title    = f"Resets:       {time_until(reset_ts)}" if reset_ts else "Resets:       —"
         else:
-            # headers absent — show HTTP status as a hint
             body = {}
             try:
                 body = resp.json()
             except Exception:
                 pass
-            status_msg = body.get("base_resp", {}).get("status_msg", f"HTTP {resp.status_code}")
+            status_msg = body.get("base_resp", {}).get("status_msg") or f"HTTP {resp.status_code}"
             self.title = "⚡ —"
             self.lbl_remaining.title = f"Remaining:  — ({status_msg})"
             self.lbl_limit.title     = "Limit:         —"
-            self.lbl_resets.title    = "Resets:       —"
+            self.lbl_resets.title    = "See ~/.minimax-tracker.log"
 
         self.lbl_updated.title = f"Last updated: {now_str}"
 
