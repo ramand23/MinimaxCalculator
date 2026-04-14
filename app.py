@@ -1,31 +1,24 @@
 """
-Minimax Token Tracker — macOS Menu Bar App
-Verifies your API key and provides quick access to the Minimax dashboard.
-Note: The Minimax API does not expose remaining quota in response headers
-for the M2.7 plan, so balance must be checked on the web dashboard.
+Claude Token Tracker — macOS Menu Bar App
+Shows remaining API token quota from Anthropic rate-limit headers.
 """
 
 import json
 import os
-import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import rumps
 
-CONFIG_PATH   = os.path.expanduser("~/.minimax-tracker.json")
-DASHBOARD_URL = "https://platform.minimax.io"
-
-REGIONS = {
-    "Global": "https://api.minimax.io",
-    "China":  "https://api.minimaxi.com",
-}
+CONFIG_PATH = os.path.expanduser("~/.claude-tracker.json")
+API_BASE    = "https://api.anthropic.com"
+API_VERSION = "2023-06-01"
+# Cheapest model — used only to ping the API and get rate-limit headers
+PING_MODEL  = "claude-haiku-4-5-20251001"
 
 DEFAULT_CONFIG = {
     "api_key":         "",
-    "region":          "Global",
-    "model":           "MiniMax-M2.7",
     "refresh_minutes": 5,
 }
 
@@ -48,35 +41,65 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-class MinimaxTrackerApp(rumps.App):
+def fmt_num(val):
+    try:
+        return f"{int(val):,}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def time_until(reset_str):
+    """Parse ISO-8601 reset timestamp and return 'in Xm Ys'."""
+    try:
+        # e.g. "2024-01-15T10:30:00Z"
+        reset_str = reset_str.rstrip("Z") + "+00:00"
+        from datetime import timezone
+        reset_dt = datetime.fromisoformat(reset_str)
+        now_dt   = datetime.now(timezone.utc)
+        diff     = int((reset_dt - now_dt).total_seconds())
+        if diff <= 0:
+            return "now"
+        if diff < 60:
+            return f"in {diff}s"
+        m, s = divmod(diff, 60)
+        return f"in {m}m {s:02d}s"
+    except Exception:
+        return "—"
+
+
+class ClaudeTrackerApp(rumps.App):
     def __init__(self):
         super().__init__("⚡ —", quit_button=None)
 
-        self.config = load_config()
+        self.config     = load_config()
         self._timer_obj = None
 
-        # --- display-only labels ---
-        self.lbl_status  = rumps.MenuItem("Status:    —")
-        self.lbl_model   = rumps.MenuItem("Model:     —")
-        self.lbl_tokens  = rumps.MenuItem("Last call: —")
-        self.lbl_updated = rumps.MenuItem("Updated:   —")
+        # display-only labels
+        self.lbl_tok_rem  = rumps.MenuItem("Tokens left:    —")
+        self.lbl_tok_lim  = rumps.MenuItem("Token limit:    —")
+        self.lbl_req_rem  = rumps.MenuItem("Requests left:  —")
+        self.lbl_resets   = rumps.MenuItem("Resets:         —")
+        self.lbl_last_use = rumps.MenuItem("Last call:      —")
+        self.lbl_updated  = rumps.MenuItem("Updated:        —")
 
-        for lbl in (self.lbl_status, self.lbl_model, self.lbl_tokens, self.lbl_updated):
+        for lbl in (self.lbl_tok_rem, self.lbl_tok_lim,
+                    self.lbl_req_rem, self.lbl_resets,
+                    self.lbl_last_use, self.lbl_updated):
             lbl.set_callback(None)
 
-        self.btn_refresh   = rumps.MenuItem("Refresh Now",       callback=self.on_refresh)
-        self.btn_dashboard = rumps.MenuItem("Open Dashboard →",  callback=self.on_open_dashboard)
-        self.btn_settings  = rumps.MenuItem("Settings…",         callback=self.on_settings)
-        self.btn_quit      = rumps.MenuItem("Quit",               callback=rumps.quit_application)
+        self.btn_refresh  = rumps.MenuItem("Refresh Now",  callback=self.on_refresh)
+        self.btn_settings = rumps.MenuItem("Settings…",    callback=self.on_settings)
+        self.btn_quit     = rumps.MenuItem("Quit",          callback=rumps.quit_application)
 
         self.menu = [
-            self.lbl_status,
-            self.lbl_model,
-            self.lbl_tokens,
+            self.lbl_tok_rem,
+            self.lbl_tok_lim,
+            self.lbl_req_rem,
+            self.lbl_resets,
             None,
+            self.lbl_last_use,
             self.lbl_updated,
             self.btn_refresh,
-            self.btn_dashboard,
             None,
             self.btn_settings,
             self.btn_quit,
@@ -108,74 +131,74 @@ class MinimaxTrackerApp(rumps.App):
 
     def _do_fetch(self):
         api_key = self.config["api_key"].strip()
-        base    = REGIONS.get(self.config.get("region", "Global"), REGIONS["Global"])
-        model   = self.config.get("model", "MiniMax-M2.7")
+        now_str = datetime.now().strftime("%-I:%M %p")
 
         req_headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type":  "application/json",
+            "x-api-key":         api_key,
+            "anthropic-version": API_VERSION,
+            "content-type":      "application/json",
         }
 
         payload = {
-            "model":     model,
-            "messages":  [{"role": "user", "content": "hi"}],
+            "model":      PING_MODEL,
             "max_tokens": 1,
+            "messages":   [{"role": "user", "content": "hi"}],
         }
 
         try:
             resp = requests.post(
-                f"{base}/v1/text/chatcompletion_v2",
+                f"{API_BASE}/v1/messages",
                 headers=req_headers,
                 json=payload,
                 timeout=15,
             )
         except requests.RequestException as exc:
             self.title = "⚡ err"
-            self.lbl_status.title  = f"Status:    Error — {exc}"
-            self.lbl_model.title   = f"Model:     {model}"
-            self.lbl_tokens.title  = "Last call: —"
-            self.lbl_updated.title = f"Updated:   {datetime.now().strftime('%-I:%M %p')}"
+            self.lbl_tok_rem.title = f"Tokens left:    error — {exc}"
+            self.lbl_updated.title = f"Updated:        {now_str}"
             return
 
-        now_str = datetime.now().strftime("%-I:%M %p")
+        h = resp.headers
 
-        if resp.status_code in (401, 403):
+        tok_rem   = h.get("anthropic-ratelimit-tokens-remaining")
+        tok_lim   = h.get("anthropic-ratelimit-tokens-limit")
+        tok_reset = h.get("anthropic-ratelimit-tokens-reset")
+        req_rem   = h.get("anthropic-ratelimit-requests-remaining")
+
+        if resp.status_code == 401:
             self.title = "⚡ auth err"
-            self.lbl_status.title  = "Status:    Auth error — check API key"
-            self.lbl_model.title   = f"Model:     {model}"
-            self.lbl_tokens.title  = "Last call: —"
-            self.lbl_updated.title = f"Updated:   {now_str}"
+            self.lbl_tok_rem.title  = "Tokens left:    Auth error — check API key"
+            self.lbl_tok_lim.title  = "Token limit:    —"
+            self.lbl_req_rem.title  = "Requests left:  —"
+            self.lbl_resets.title   = "Resets:         —"
+            self.lbl_last_use.title = "Last call:      —"
+            self.lbl_updated.title  = f"Updated:        {now_str}"
             return
 
-        # Parse usage from response body
-        total_tokens = None
+        # Per-call usage from response body
+        call_tokens = None
         try:
-            body = resp.json()
-            usage = body.get("usage", {})
-            total_tokens  = usage.get("total_tokens")
-            prompt_tokens = usage.get("prompt_tokens")
-            comp_tokens   = usage.get("completion_tokens")
+            body        = resp.json()
+            usage       = body.get("usage", {})
+            in_tok      = usage.get("input_tokens",  0)
+            out_tok     = usage.get("output_tokens", 0)
+            call_tokens = in_tok + out_tok
         except Exception:
             pass
 
-        if resp.status_code == 200:
-            self.title = "⚡ OK"
-            self.lbl_status.title = "Status:    Connected ✓"
+        if tok_rem is not None:
+            self.title = f"⚡ {fmt_num(tok_rem)}"
         else:
-            self.title = f"⚡ {resp.status_code}"
-            self.lbl_status.title = f"Status:    HTTP {resp.status_code}"
+            self.title = "⚡ OK" if resp.status_code == 200 else f"⚡ {resp.status_code}"
 
-        self.lbl_model.title = f"Model:     {model}"
-
-        if total_tokens is not None:
-            self.lbl_tokens.title = (
-                f"Last call: {total_tokens} tokens"
-                f"  ({prompt_tokens}↑ {comp_tokens}↓)"
-            )
-        else:
-            self.lbl_tokens.title = "Last call: —"
-
-        self.lbl_updated.title = f"Updated:   {now_str}"
+        self.lbl_tok_rem.title  = f"Tokens left:    {fmt_num(tok_rem)}"
+        self.lbl_tok_lim.title  = f"Token limit:    {fmt_num(tok_lim)}"
+        self.lbl_req_rem.title  = f"Requests left:  {fmt_num(req_rem)}"
+        self.lbl_resets.title   = f"Resets:         {time_until(tok_reset) if tok_reset else '—'}"
+        self.lbl_last_use.title = (
+            f"Last call:      {call_tokens:,} tokens" if call_tokens is not None else "Last call:      —"
+        )
+        self.lbl_updated.title  = f"Updated:        {now_str}"
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -184,71 +207,36 @@ class MinimaxTrackerApp(rumps.App):
     @rumps.clicked("Refresh Now")
     def on_refresh(self, _):
         if not self.config["api_key"]:
-            rumps.alert("No API key", "Open Settings and enter your Minimax API key.")
+            rumps.alert("No API key", "Open Settings and enter your Anthropic API key.")
             return
         threading.Thread(target=self._do_fetch, daemon=True).start()
 
-    @rumps.clicked("Open Dashboard →")
-    def on_open_dashboard(self, _):
-        subprocess.run(["open", DASHBOARD_URL])
-
     @rumps.clicked("Settings…")
     def on_settings(self, _):
-        # API Key
         r = rumps.Window(
-            message="Enter your Minimax API key:",
-            title="Minimax Tracker — Settings",
+            message="Enter your Anthropic API key (starts with sk-ant-):",
+            title="Claude Tracker — Settings",
             default_text=self.config["api_key"],
-            ok="Next", cancel="Cancel", dimensions=(400, 24),
+            ok="Next", cancel="Cancel", dimensions=(420, 24),
         ).run()
         if not r.clicked:
             return
         api_key = r.text.strip()
 
-        # Model
         r2 = rumps.Window(
-            message="Model name (e.g. MiniMax-M2.7):",
-            title="Minimax Tracker — Settings",
-            default_text=self.config.get("model", "MiniMax-M2.7"),
-            ok="Next", cancel="Cancel", dimensions=(400, 24),
+            message="Auto-refresh every N minutes (e.g. 5):",
+            title="Claude Tracker — Settings",
+            default_text=str(self.config.get("refresh_minutes", 5)),
+            ok="Save", cancel="Cancel", dimensions=(420, 24),
         ).run()
         if not r2.clicked:
             return
-        model = r2.text.strip() or "MiniMax-M2.7"
-
-        # Region
-        current_region = self.config.get("region", "Global")
-        region_hint = " / ".join(
-            f"[{opt}]" if opt == current_region else opt
-            for opt in REGIONS
-        )
-        r3 = rumps.Window(
-            message=f"Region ({region_hint}):",
-            title="Minimax Tracker — Settings",
-            default_text=current_region,
-            ok="Next", cancel="Cancel", dimensions=(400, 24),
-        ).run()
-        if not r3.clicked:
-            return
-        region = r3.text.strip() if r3.text.strip() in REGIONS else "Global"
-
-        # Refresh interval
-        r4 = rumps.Window(
-            message="Auto-refresh every N minutes (e.g. 5):",
-            title="Minimax Tracker — Settings",
-            default_text=str(self.config.get("refresh_minutes", 5)),
-            ok="Save", cancel="Cancel", dimensions=(400, 24),
-        ).run()
-        if not r4.clicked:
-            return
         try:
-            minutes = max(1, int(r4.text.strip()))
+            minutes = max(1, int(r2.text.strip()))
         except ValueError:
             minutes = 5
 
         self.config["api_key"]         = api_key
-        self.config["model"]           = model
-        self.config["region"]          = region
         self.config["refresh_minutes"] = minutes
         save_config(self.config)
         self._apply_timer()
@@ -258,4 +246,4 @@ class MinimaxTrackerApp(rumps.App):
 
 
 if __name__ == "__main__":
-    MinimaxTrackerApp().run()
+    ClaudeTrackerApp().run()
