@@ -67,7 +67,7 @@ def time_until(reset_str):
         return "—"
 
 
-class ClaudeTrackerApp(rumps.App):
+class ClaudeTokenTrackerApp(rumps.App):
     def __init__(self):
         super().__init__("⚡ —", quit_button=None)
 
@@ -215,7 +215,7 @@ class ClaudeTrackerApp(rumps.App):
     def on_settings(self, _):
         r = rumps.Window(
             message="Enter your Anthropic API key (starts with sk-ant-):",
-            title="Claude Tracker — Settings",
+            title="Claude Token Tracker — Settings",
             default_text=self.config["api_key"],
             ok="Next", cancel="Cancel", dimensions=(420, 24),
         ).run()
@@ -225,7 +225,7 @@ class ClaudeTrackerApp(rumps.App):
 
         r2 = rumps.Window(
             message="Auto-refresh every N minutes (e.g. 5):",
-            title="Claude Tracker — Settings",
+            title="Claude Token Tracker — Settings",
             default_text=str(self.config.get("refresh_minutes", 5)),
             ok="Save", cancel="Cancel", dimensions=(420, 24),
         ).run()
@@ -246,4 +246,4 @@ class ClaudeTrackerApp(rumps.App):
 
 
 if __name__ == "__main__":
-    ClaudeTrackerApp().run()
+    ClaudeTokenTrackerApp().run()

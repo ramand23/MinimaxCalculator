@@ -1,4 +1,4 @@
-# Minimax Token Tracker
+# Claude Token Tracker
 
 A lightweight macOS menu bar app that shows your remaining Minimax API quota at a glance.
 
