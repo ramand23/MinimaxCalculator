@@ -1,17 +1,21 @@
 """
 Minimax Token Tracker — macOS Menu Bar App
-Displays remaining API quota from Minimax rate-limit headers.
+Verifies your API key and provides quick access to the Minimax dashboard.
+Note: The Minimax API does not expose remaining quota in response headers
+for the M2.7 plan, so balance must be checked on the web dashboard.
 """
 
 import json
 import os
+import subprocess
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
 import rumps
 
-CONFIG_PATH = os.path.expanduser("~/.minimax-tracker.json")
+CONFIG_PATH   = os.path.expanduser("~/.minimax-tracker.json")
+DASHBOARD_URL = "https://platform.minimax.io"
 
 REGIONS = {
     "Global": "https://api.minimax.io",
@@ -19,9 +23,9 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "api_key": "",
-    "region": "Global",
-    "model": "MiniMax-M2.7",
+    "api_key":         "",
+    "region":          "Global",
+    "model":           "MiniMax-M2.7",
     "refresh_minutes": 5,
 }
 
@@ -31,7 +35,6 @@ def load_config():
         try:
             with open(CONFIG_PATH) as f:
                 data = json.load(f)
-            # fill in any missing keys from defaults
             for k, v in DEFAULT_CONFIG.items():
                 data.setdefault(k, v)
             return data
@@ -45,21 +48,6 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-def time_until(reset_ts):
-    """Return a human-readable 'in X min' string from a Unix timestamp."""
-    try:
-        reset_ts = int(reset_ts)
-        now = int(datetime.now(timezone.utc).timestamp())
-        diff = reset_ts - now
-        if diff <= 0:
-            return "now"
-        if diff < 60:
-            return f"in {diff}s"
-        return f"in {diff // 60}m"
-    except Exception:
-        return "—"
-
-
 class MinimaxTrackerApp(rumps.App):
     def __init__(self):
         super().__init__("⚡ —", quit_button=None)
@@ -67,28 +55,28 @@ class MinimaxTrackerApp(rumps.App):
         self.config = load_config()
         self._timer_obj = None
 
-        # --- menu items ---
-        self.lbl_remaining = rumps.MenuItem("Remaining:  —")
-        self.lbl_limit     = rumps.MenuItem("Limit:         —")
-        self.lbl_resets    = rumps.MenuItem("Resets:       —")
-        self.lbl_updated   = rumps.MenuItem("Last updated: —")
-        self.btn_refresh   = rumps.MenuItem("Refresh Now", callback=self.on_refresh)
-        self.btn_settings  = rumps.MenuItem("Settings…",   callback=self.on_settings)
-        self.btn_quit      = rumps.MenuItem("Quit",         callback=rumps.quit_application)
+        # --- display-only labels ---
+        self.lbl_status  = rumps.MenuItem("Status:    —")
+        self.lbl_model   = rumps.MenuItem("Model:     —")
+        self.lbl_tokens  = rumps.MenuItem("Last call: —")
+        self.lbl_updated = rumps.MenuItem("Updated:   —")
 
-        # disable info labels (they're display-only)
-        self.lbl_remaining.set_callback(None)
-        self.lbl_limit.set_callback(None)
-        self.lbl_resets.set_callback(None)
-        self.lbl_updated.set_callback(None)
+        for lbl in (self.lbl_status, self.lbl_model, self.lbl_tokens, self.lbl_updated):
+            lbl.set_callback(None)
+
+        self.btn_refresh   = rumps.MenuItem("Refresh Now",       callback=self.on_refresh)
+        self.btn_dashboard = rumps.MenuItem("Open Dashboard →",  callback=self.on_open_dashboard)
+        self.btn_settings  = rumps.MenuItem("Settings…",         callback=self.on_settings)
+        self.btn_quit      = rumps.MenuItem("Quit",               callback=rumps.quit_application)
 
         self.menu = [
-            self.lbl_remaining,
-            self.lbl_limit,
-            self.lbl_resets,
+            self.lbl_status,
+            self.lbl_model,
+            self.lbl_tokens,
             None,
             self.lbl_updated,
             self.btn_refresh,
+            self.btn_dashboard,
             None,
             self.btn_settings,
             self.btn_quit,
@@ -96,16 +84,14 @@ class MinimaxTrackerApp(rumps.App):
 
         self._apply_timer()
 
-        # initial fetch (non-blocking)
         if self.config["api_key"]:
             threading.Thread(target=self._do_fetch, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Timer management
+    # Timer
     # ------------------------------------------------------------------
 
     def _apply_timer(self):
-        """Set (or reset) the periodic refresh timer."""
         interval = max(1, int(self.config.get("refresh_minutes", 5))) * 60
         if self._timer_obj:
             self._timer_obj.stop()
@@ -117,13 +103,8 @@ class MinimaxTrackerApp(rumps.App):
             threading.Thread(target=self._do_fetch, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Fetch logic
+    # Fetch
     # ------------------------------------------------------------------
-
-    def _write_log(self, text):
-        log_path = os.path.expanduser("~/.minimax-tracker.log")
-        with open(log_path, "w") as f:
-            f.write(text)
 
     def _do_fetch(self):
         api_key = self.config["api_key"].strip()
@@ -135,29 +116,9 @@ class MinimaxTrackerApp(rumps.App):
             "Content-Type":  "application/json",
         }
 
-        now_str = datetime.now().strftime("%-I:%M %p")
-
-        # --- Step 1: try coding plan remains endpoint ---
-        plan_remaining = None
-        try:
-            plan_resp = requests.get(
-                f"{base}/v1/api/openplatform/coding_plan/remains",
-                headers=req_headers,
-                timeout=10,
-            )
-            plan_body = plan_resp.json()
-            base_resp = plan_body.get("base_resp", {})
-            if base_resp.get("status_code") == 0:
-                model_remains = plan_body.get("model_remains", [])
-                if model_remains:
-                    plan_remaining = model_remains
-        except Exception:
-            pass
-
-        # --- Step 2: minimal chat call to get rate-limit headers ---
         payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
+            "model":     model,
+            "messages":  [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
         }
 
@@ -169,76 +130,52 @@ class MinimaxTrackerApp(rumps.App):
                 timeout=15,
             )
         except requests.RequestException as exc:
-            rumps.notification("Minimax Tracker", "Network error", str(exc), sound=False)
             self.title = "⚡ err"
+            self.lbl_status.title  = f"Status:    Error — {exc}"
+            self.lbl_model.title   = f"Model:     {model}"
+            self.lbl_tokens.title  = "Last call: —"
+            self.lbl_updated.title = f"Updated:   {datetime.now().strftime('%-I:%M %p')}"
             return
 
-        # Write debug log with full headers + body
-        log_lines = [
-            f"=== Minimax Tracker Debug Log — {datetime.now()} ===\n",
-            f"Endpoint: POST {base}/v1/text/chatcompletion_v2\n",
-            f"Model: {model}\n",
-            f"HTTP status: {resp.status_code}\n\n",
-            "--- Response Headers ---\n",
-        ]
-        for k, v in resp.headers.items():
-            log_lines.append(f"  {k}: {v}\n")
-        try:
-            log_lines.append(f"\n--- Response Body ---\n{json.dumps(resp.json(), indent=2)}\n")
-        except Exception:
-            log_lines.append(f"\n--- Response Body (raw) ---\n{resp.text[:500]}\n")
-        self._write_log("".join(log_lines))
+        now_str = datetime.now().strftime("%-I:%M %p")
 
         if resp.status_code in (401, 403):
             self.title = "⚡ auth err"
-            rumps.notification("Minimax Tracker", "Auth error", "Check your API key in Settings.", sound=False)
+            self.lbl_status.title  = "Status:    Auth error — check API key"
+            self.lbl_model.title   = f"Model:     {model}"
+            self.lbl_tokens.title  = "Last call: —"
+            self.lbl_updated.title = f"Updated:   {now_str}"
             return
 
-        # Check all common rate-limit header spellings
-        remaining = (
-            resp.headers.get("X-RateLimit-Remaining")
-            or resp.headers.get("x-ratelimit-remaining")
-            or resp.headers.get("RateLimit-Remaining")
-            or resp.headers.get("ratelimit-remaining")
-        )
-        limit = (
-            resp.headers.get("X-RateLimit-Limit")
-            or resp.headers.get("x-ratelimit-limit")
-            or resp.headers.get("RateLimit-Limit")
-        )
-        reset_ts = (
-            resp.headers.get("X-RateLimit-Reset")
-            or resp.headers.get("x-ratelimit-reset")
-            or resp.headers.get("RateLimit-Reset")
-        )
+        # Parse usage from response body
+        total_tokens = None
+        try:
+            body = resp.json()
+            usage = body.get("usage", {})
+            total_tokens  = usage.get("total_tokens")
+            prompt_tokens = usage.get("prompt_tokens")
+            comp_tokens   = usage.get("completion_tokens")
+        except Exception:
+            pass
 
-        if plan_remaining is not None:
-            # Show coding plan data (list of per-model entries)
-            first = plan_remaining[0]
-            rem_val = first.get("remaining") or first.get("remain") or "?"
-            total   = first.get("total") or first.get("limit") or "?"
-            self.title = f"⚡ {rem_val} rem"
-            self.lbl_remaining.title = f"Remaining:  {rem_val}"
-            self.lbl_limit.title     = f"Limit:         {total}"
-            self.lbl_resets.title    = "Resets:       —"
-        elif remaining is not None:
-            self.title = f"⚡ {int(remaining):,} rem"
-            self.lbl_remaining.title = f"Remaining:  {int(remaining):,}"
-            self.lbl_limit.title     = f"Limit:         {int(limit):,}" if limit else "Limit:         —"
-            self.lbl_resets.title    = f"Resets:       {time_until(reset_ts)}" if reset_ts else "Resets:       —"
+        if resp.status_code == 200:
+            self.title = "⚡ OK"
+            self.lbl_status.title = "Status:    Connected ✓"
         else:
-            body = {}
-            try:
-                body = resp.json()
-            except Exception:
-                pass
-            status_msg = body.get("base_resp", {}).get("status_msg") or f"HTTP {resp.status_code}"
-            self.title = "⚡ —"
-            self.lbl_remaining.title = f"Remaining:  — ({status_msg})"
-            self.lbl_limit.title     = "Limit:         —"
-            self.lbl_resets.title    = "See ~/.minimax-tracker.log"
+            self.title = f"⚡ {resp.status_code}"
+            self.lbl_status.title = f"Status:    HTTP {resp.status_code}"
 
-        self.lbl_updated.title = f"Last updated: {now_str}"
+        self.lbl_model.title = f"Model:     {model}"
+
+        if total_tokens is not None:
+            self.lbl_tokens.title = (
+                f"Last call: {total_tokens} tokens"
+                f"  ({prompt_tokens}↑ {comp_tokens}↓)"
+            )
+        else:
+            self.lbl_tokens.title = "Last call: —"
+
+        self.lbl_updated.title = f"Updated:   {now_str}"
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -247,77 +184,65 @@ class MinimaxTrackerApp(rumps.App):
     @rumps.clicked("Refresh Now")
     def on_refresh(self, _):
         if not self.config["api_key"]:
-            rumps.alert("No API key set", "Open Settings and enter your Minimax API key.")
+            rumps.alert("No API key", "Open Settings and enter your Minimax API key.")
             return
         threading.Thread(target=self._do_fetch, daemon=True).start()
 
+    @rumps.clicked("Open Dashboard →")
+    def on_open_dashboard(self, _):
+        subprocess.run(["open", DASHBOARD_URL])
+
     @rumps.clicked("Settings…")
     def on_settings(self, _):
-        # --- API Key ---
-        win_key = rumps.Window(
+        # API Key
+        r = rumps.Window(
             message="Enter your Minimax API key:",
             title="Minimax Tracker — Settings",
             default_text=self.config["api_key"],
-            ok="Next",
-            cancel="Cancel",
-            dimensions=(400, 24),
-        )
-        win_key.default_text = self.config["api_key"]
-        r = win_key.run()
+            ok="Next", cancel="Cancel", dimensions=(400, 24),
+        ).run()
         if not r.clicked:
             return
         api_key = r.text.strip()
 
-        # --- Model ---
-        win_model = rumps.Window(
-            message="Model name (e.g. MiniMax-M2.7, abab6.5s-chat):",
+        # Model
+        r2 = rumps.Window(
+            message="Model name (e.g. MiniMax-M2.7):",
             title="Minimax Tracker — Settings",
             default_text=self.config.get("model", "MiniMax-M2.7"),
-            ok="Next",
-            cancel="Cancel",
-            dimensions=(400, 24),
-        )
-        r1b = win_model.run()
-        if not r1b.clicked:
+            ok="Next", cancel="Cancel", dimensions=(400, 24),
+        ).run()
+        if not r2.clicked:
             return
-        model = r1b.text.strip() or "MiniMax-M2.7"
+        model = r2.text.strip() or "MiniMax-M2.7"
 
-        # --- Region ---
-        region_options = list(REGIONS.keys())
+        # Region
         current_region = self.config.get("region", "Global")
         region_hint = " / ".join(
             f"[{opt}]" if opt == current_region else opt
-            for opt in region_options
+            for opt in REGIONS
         )
-        win_region = rumps.Window(
+        r3 = rumps.Window(
             message=f"Region ({region_hint}):",
             title="Minimax Tracker — Settings",
             default_text=current_region,
-            ok="Next",
-            cancel="Cancel",
-            dimensions=(400, 24),
-        )
-        r2 = win_region.run()
-        if not r2.clicked:
-            return
-        region = r2.text.strip()
-        if region not in REGIONS:
-            region = "Global"
-
-        # --- Refresh interval ---
-        win_interval = rumps.Window(
-            message="Refresh every N minutes (e.g. 5):",
-            title="Minimax Tracker — Settings",
-            default_text=str(self.config.get("refresh_minutes", 5)),
-            ok="Save",
-            cancel="Cancel",
-            dimensions=(400, 24),
-        )
-        r3 = win_interval.run()
+            ok="Next", cancel="Cancel", dimensions=(400, 24),
+        ).run()
         if not r3.clicked:
             return
+        region = r3.text.strip() if r3.text.strip() in REGIONS else "Global"
+
+        # Refresh interval
+        r4 = rumps.Window(
+            message="Auto-refresh every N minutes (e.g. 5):",
+            title="Minimax Tracker — Settings",
+            default_text=str(self.config.get("refresh_minutes", 5)),
+            ok="Save", cancel="Cancel", dimensions=(400, 24),
+        ).run()
+        if not r4.clicked:
+            return
         try:
-            minutes = max(1, int(r3.text.strip()))
+            minutes = max(1, int(r4.text.strip()))
         except ValueError:
             minutes = 5
 
